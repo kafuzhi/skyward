@@ -199,6 +199,104 @@ pub struct Opening {
     pub closed: Vec<Closed>,
 }
 
+/// Check and repair `device` with f2fs's own tool, as the other recovery's
+/// repair does: `-a` answers its questions itself.
+fn repair(device: &Path) -> Result<()> {
+    let tool = "/system/bin/fsck.f2fs";
+    if !Path::new(tool).exists() {
+        return Err(anyhow::anyhow!("{tool} is not in this recovery"));
+    }
+    let out = std::process::Command::new(tool)
+        .arg("-a")
+        .arg(device)
+        .output()
+        .with_context(|| format!("run {tool}"))?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    let tail: String = said.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+    let _ = skyward_sys::kmsg(&format!("fsck.f2fs {}: {:?} {tail}", device.display(), out.status));
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("fsck.f2fs ended with {:?}", out.status));
+    }
+    Ok(())
+}
+
+/// Open the data partition as it lies, with no key: an owner who left it
+/// unencrypted, as a ROM built that way does, has a filesystem there that
+/// mounts as it is. Everything is readable, so no user's files stay closed.
+pub fn open_plain() -> Result<Opening> {
+    if mount::is_mount_point(Path::new(MOUNT))? {
+        return Ok(Opening { mounted: None, closed: Vec::new() });
+    }
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    let first = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
+    let device = PathBuf::from(skyward_block::fstab::device(first)?);
+    let holds = skyward_block::probe::filesystem(&device)?;
+    let entry = entries.iter().find(|e| holds.as_ref() == Some(&e.filesystem)).unwrap_or(first);
+    std::fs::create_dir_all(MOUNT).with_context(|| format!("make {MOUNT}"))?;
+    // Writable in one mount, which is what lets f2fs replay the checkpoint a
+    // partition left dirty still holds: a read-only mount and a remount
+    // after it replay nothing, and writing into that state took a phone down
+    // as soon as a file went in. Only what this kernel may know is passed;
+    // the rest of the phone's own options name features a newer f2fs has.
+    let known = ["noatime", "nosuid", "nodev", "discard", "rw"];
+    let options: Vec<String> = entry.options.iter().filter(|o| known.contains(&o.as_str())).cloned().collect();
+    let mut tried: Vec<String> = Vec::new();
+    let mut mounted = Err(anyhow::anyhow!("nothing tried"));
+    let mut repaired = false;
+    for attempt in [options.clone(), vec!["rw".to_string()], vec!["ro".to_string()]] {
+        let said = attempt.join(",");
+        match mount::mount(&device, Path::new(MOUNT), &entry.filesystem, &attempt) {
+            Ok(()) => {
+                // Which options the mount took, since a read-only mount here
+                // means a partition that cannot be written into safely.
+                let _ = skyward_sys::kmsg(&format!("{MOUNT}: mounted with [{said}]"));
+                tried.push(said);
+                mounted = Ok(());
+                break;
+            }
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!("{MOUNT}: mount [{said}] failed: {e:#}"));
+                tried.push(format!("{said} ({e:#})"));
+                mounted = Err(e);
+                // The other recovery repairs a partition its own table asks
+                // for with fsck, and a partition left dirty by a system that
+                // did not shut down is why a writable mount is refused: the
+                // check and repair comes before trying to write again.
+                if !repaired {
+                    repaired = true;
+                    if let Err(e) = repair(Path::new(&device)) {
+                        let _ = skyward_sys::kmsg(&format!("{MOUNT}: the check did not end well: {e:#}"));
+                    }
+                }
+            }
+        }
+    }
+    mounted.with_context(|| format!("{} is encrypted or damaged; tried {}", device.display(), tried.join("; ")))?;
+    // The owner's shared storage, as an encrypted partition shows it once its
+    // keys are let in: made where the partition holds none yet, so that
+    // /sdcard exists either way.
+    // A partition that mounts as it lies may still hold encrypted files: the
+    // other recovery asks the same question after the same mount, by the key
+    // files a phone of its own leaves under unencrypted. Where they are, the
+    // files below are ciphertext, and saying so is better than reading them.
+    let key_files = Path::new(MOUNT).join("unencrypted/key/version");
+    if key_files.exists() {
+        let _ = skyward_sys::kmsg(&format!("{MOUNT}: {} shows the partition is encrypted, file by file", key_files.display()));
+        return Err(anyhow::anyhow!(
+            "{MOUNT} is encrypted file by file: it mounts, but the files in it are ciphertext and need a key this recovery does not hold"
+        ));
+    }
+    let media = Path::new(SHARED_STORAGE).join(OWNER.to_string());
+    let _ = std::fs::create_dir_all(&media);
+    if let Err(e) = show_owner_storage() {
+        eprintln!("sdcard: {e:#}");
+    }
+    Ok(Opening {
+        mounted: Some(Opened { mapped: device, filesystem: entry.filesystem.clone(), checked: None }),
+        closed: Vec::new(),
+    })
+}
+
 /// Open the data partition as far as it opens with nothing a user knows:
 /// mount it where it is not mounted, let in the keys of the files that
 /// belong to no one user and of each user's files readable before they

@@ -2319,6 +2319,7 @@ dependencies = [
  "sha2 0.10.9",
  "skyward-binder",
  "skyward-block",
+ "skyward-sys",
 ]
 
 [[package]]
@@ -2425,6 +2426,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cpio",
+ "flate2",
  "lz4_flex",
  "serde_json",
  "sha2 0.10.9",

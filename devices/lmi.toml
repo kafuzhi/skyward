@@ -1,0 +1,60 @@
+# Redmi K30 Pro / POCO F2 Pro (lmi), SM8250, A-only, real recovery partition.
+[device]
+codename = "lmi"
+brand = "Redmi"
+model = "Redmi K30 Pro"
+ab = false
+soc = { hans = "骁龙865", hant = "驍龍865", en = "Snapdragon 865" }
+os_version_prop = "ro.build.version.incremental"
+
+[display]
+width = 1080
+height = 2400
+density = 440
+
+# lmi is non-GKI: modules live on vendor only (no vendor_boot / vendor_dlkm).
+[modules]
+sources = ["vendor"]
+load = []
+
+[partitions]
+mounted = ["firmware", "persist", "bluetooth", "dsp"]
+
+[[service]]
+path = "/vendor/bin/qseecomd"
+user = "root"
+groups = ["root"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.keymaster@4.0-service-qti"
+user = "root"
+groups = ["root", "system"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"
+user = "root"
+groups = ["root", "system"]
+
+# The phone's own touch driver makes a virtual panel beside the real one;
+# the recovery takes the first direct multitouch device, so name it out.
+# (TWRP needs the same with TW_INPUT_BLACKLIST := "hbtp_vm".)
+[touch]
+ignore = ["hbtp_vm"]
+
+# lmi's Awinic aw8697 driver exposes no leds/timed_output node: it takes a
+# waveform by index, a mode, a duration in milliseconds, and an activate.
+# Mode 0 is one play of the waveform, which is what a click is.
+[haptics]
+sysfs = "/sys/bus/i2c/drivers/aw8697_haptic/3-005a"
+duration_ms = 40
+wave = 1
+mode = 0
+strength = { lightest = 0.4, strongest = 1.0 }
+
+# WLAN is not brought up for now: the vendor partition's modules speak to a
+# key service this recovery does not reach yet, and the pages that need it
+# are left out while it is off. What it would take is written here for later.
+#
+# [wlan]
+# modules = ["qca_cld3_qca6390"]
+# ...

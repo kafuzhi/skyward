@@ -478,12 +478,80 @@ pub struct Port {
     event: Option<(u64, Box<[u8; 16]>)>,
 }
 
+/// Mount the MTP function's filesystem where the ramdisk did not: functionfs
+/// makes the control endpoint appear as soon as it is mounted, and the
+/// descriptors are written to it after.
+fn mount_functionfs() -> Result<()> {
+    use std::ffi::CString;
+    let dir = "/dev/usb-ffs/mtp";
+    // functionfs is mounted by the name of a function the gadget has: the
+    // function has to be there first, and a ramdisk from another recovery
+    // makes one of another kind, or none.
+    // configfs carries the functions; where the ramdisk left it unmounted,
+    // it is mounted here so that the function can be made at all.
+    if !std::path::Path::new("/config/usb_gadget").exists() {
+        let (none, at) = (CString::new("none")?, CString::new("/config")?);
+        let kind = CString::new("configfs")?;
+        std::fs::create_dir_all("/config").with_context(|| "make /config")?;
+        let mounted = unsafe { libc::mount(none.as_ptr(), at.as_ptr(), kind.as_ptr(), 0, std::ptr::null()) };
+        if mounted != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EBUSY) {
+                eprintln!("mtp: mount configfs on /config: {e}");
+            }
+        }
+    }
+    let function = "/config/usb_gadget/g1/functions/ffs.mtp";
+    match std::fs::create_dir_all(function) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::PermissionDenied || e.raw_os_error() == Some(libc::ENOENT) => {
+            eprintln!("mtp: {function} is not there: {e}");
+        }
+        Err(e) => return Err(e).with_context(|| format!("make {function}")),
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("make {dir}"))?;
+    // A ramdisk from another recovery mounts its own functionfs here first,
+    // with its own options and, on this kernel, before any function of ours
+    // exists; that mount has no control endpoint to give. It goes, and the
+    // function's own filesystem takes its place.
+    let at = CString::new(dir)?;
+    unsafe { libc::umount2(at.as_ptr(), libc::MNT_DETACH) };
+    let (source, target) = (CString::new("mtp")?, CString::new(dir)?);
+    let kind = CString::new("functionfs")?;
+    let options = CString::new("rmode=0770,fmode=0660,uid=0,gid=0")?;
+    let mounted = unsafe { libc::mount(source.as_ptr(), target.as_ptr(), kind.as_ptr(), 0, options.as_ptr().cast()) };
+    if mounted != 0 {
+        let e = io::Error::last_os_error();
+        // Already mounted by the ramdisk is the other way it can be there.
+        if e.raw_os_error() != Some(libc::EBUSY) {
+            return Err(e).with_context(|| format!("mount functionfs on {dir}"));
+        }
+    }
+    Ok(())
+}
+
 impl Port {
     /// Hand the kernel the function's descriptors, which it needs before
     /// init can bind the function, and open its endpoints; `wake` is what
     /// the phone wakes the function's thread with.
     pub fn open(wake: RawFd) -> Result<Port> {
-        let ep0 = OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC).open(EP0).with_context(|| format!("open {EP0}"))?;
+        let ep0 = match OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC).open(EP0) {
+            Ok(file) => file,
+            // A ramdisk from another recovery may bind the MTP function
+            // itself, or not mount its filesystem at all: the function's
+            // filesystem is mounted here where it is missing, so that the
+            // transfer works from either kind of ramdisk.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                mount_functionfs().context("mount the MTP function's filesystem")?;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC)
+                    .open(EP0)
+                    .with_context(|| format!("open {EP0}"))?
+            }
+            Err(e) => return Err(e).with_context(|| format!("open {EP0}")),
+        };
         (&ep0).write_all(descriptors().as_bytes()).context("write the MTP descriptors")?;
         (&ep0).write_all(strings().as_bytes()).context("write the MTP strings")?;
         // Without blocking, a transfer started as the function goes fails

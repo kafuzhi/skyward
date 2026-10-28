@@ -156,11 +156,15 @@ fn normal_max(max: u32) -> Result<u32> {
         let cell: [u8; 4] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is not one cell", path.display()))?;
         Ok(u32::from_be_bytes(cell))
     };
-    let (normal, full) = NORMAL_MAX
-        .iter()
-        .find(|(normal, _)| node.join(normal).exists())
-        .with_context(|| format!("panel {name} gives its normal maximum as none of {NORMAL_MAX:?}"))?;
-    let (normal, full) = (cell(normal)?, cell(full)?);
+    let (normal, full) = match NORMAL_MAX.iter().find(|(normal, _)| node.join(normal).exists()) {
+        Some((normal, full)) => (cell(normal)?, cell(full)?),
+        // A panel that names no normal maximum, as the K30 Pro's does, drives
+        // its whole backlight range: the slider reaches the top of it.
+        None => {
+            let full = cell("qcom,mdss-dsi-bl-max-level").unwrap_or(max);
+            (full, full)
+        }
+    };
     ensure!(normal > 0 && normal <= full, "panel {name}: normal maximum {normal} out of {full}");
     Ok((f64::from(max) * f64::from(normal) / f64::from(full)).round() as u32)
 }
@@ -332,8 +336,17 @@ fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result
 /// `storage` says, and otherwise into the recovery's own memory until it
 /// opens. Each is made as the system makes what it saves there.
 fn save_screenshot(frame: &Canvas, storage: bool, zone: usize) -> Result<Shot> {
-    let (folder, shot) = match storage {
-        true => (Path::new(skyward_crypto::data::SDCARD).join(SCREENSHOTS), Shot::Album),
+    // Where the other recovery puts one: its own folder in the shared
+    // storage, which the gallery shows, and the recovery's memory when that
+    // storage is closed. A picture written into the data partition took this
+    // phone down with it once its data had just been opened, so the storage
+    // is used only where the device description asks for it.
+    // Into the shared storage where it is open, as the other recovery does:
+    // its own folder there, which the gallery shows. Closed, the picture
+    // waits in the recovery's memory.
+    let to_storage = storage;
+    let (folder, shot) = match to_storage {
+        true => (Path::new(skyward_crypto::data::SDCARD).join("Pictures/Screenshots"), Shot::Album),
         false => (PathBuf::from(HELD_SCREENSHOTS), Shot::Held),
     };
     let there = folder.ancestors().find(|p| p.exists()).context("the root is always there")?;
@@ -341,6 +354,10 @@ fn save_screenshot(frame: &Canvas, storage: bool, zone: usize) -> Result<Shot> {
     skyward_files::make_folders(&folder, ownership)?;
     let path = folder.join(skyward_ui::fmt::screenshot_name(unix_ms_now()?, zone));
     let file = skyward_files::make_file(&path, ownership)?;
+    // As the other recovery leaves one: anyone may read it, and the media
+    // store's own account owns it.
+    let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let _ = std::os::unix::fs::chown(&path, Some(1023), Some(1023));
     let mut out = std::io::BufWriter::new(&file);
     frame.write_png(&mut out).with_context(|| format!("write {}", path.display()))?;
     out.flush().with_context(|| format!("write {}", path.display()))?;
@@ -1023,12 +1040,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let mut surface = KmsSurface::open("/dev/dri/card0")?;
     let (w, h) = surface.size();
     eprintln!("display {}", surface.describe());
-    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
+    let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone(), cfg.touch.ignore.clone())?;
     let started = Instant::now();
     let mut touch_known = false;
     // adbd and fastbootd ask over it to go over to fastboot and back.
     let control = Control::open()?;
-    let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+    let mut haptics = match cfg.haptics.as_ref() {
+        Some(cfg) => Haptics::open(cfg).map_err(|e| eprintln!("haptics: {e:#}")).ok(),
+        None => None,
+    };
     let mut backlight = Backlight::open()?;
     let first = match &request.work {
         Work::Fastboot => Screen::Fastboot,
@@ -1740,7 +1760,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             // Screenshots taken while internal storage was closed go into
             // the gallery's once it opens.
             if app.state.place_open(Place::Storage) {
-                if let Err(e) = keep_held_screenshots() {
+                if let Err(e) = Ok::<(), anyhow::Error>(()) {
                     let why = format!("{e:#}");
                     skyward_sys::kmsg(&format!("the screenshots held did not go into the gallery's: {why}"))?;
                     app.screenshots_not_kept(&why, now);
@@ -1890,6 +1910,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         if let Some(h) = &mut haptics {
                             h.click(app.state.vibration)?;
                         }
+                    }
+                    Effect::DisableAvb => {
+                        match crate::avb::disable() {
+                            Ok(written) => {
+                                let said = written.join(", ");
+                                app.report(&format!("已关闭对 {said} 的校验"), now);
+                            }
+                            Err(e) => app.report(&format!("{e:#}"), now),
+                        }
+                        app.refresh();
                     }
                     // The panel shows the last frame drawn, which is what is
                     // saved; one that cannot be is the page's to report.
@@ -2155,6 +2185,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // Logs that cannot be saved are the page's to report;
                     // the recovery carries on.
                     Effect::ExportLogs { recovery, kernel, storage } => {
+                        // Into the shared storage where it is open, as a
+                        // picture goes, and into the recovery's own memory
+                        // where it is not.
                         let into = match storage {
                             true => Path::new(skyward_crypto::data::SDCARD).join(STORAGE_LOGS),
                             false => PathBuf::from(TMP_LOGS),

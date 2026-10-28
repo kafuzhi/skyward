@@ -6,6 +6,7 @@ use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "android")]
+mod avb;
 mod backup;
 #[cfg(target_os = "android")]
 mod decrypt;
@@ -151,6 +152,10 @@ enum Cmd {
     /// directory, such as android.hardware.security.keymint.IKeyMintDevice/default.
     #[cfg(target_os = "android")]
     Service { name: String },
+    /// Report the phone's key service of the older kind: how the secure
+    /// world is built, which is all it says without a key.
+    #[cfg(target_os = "android")]
+    Keymaster,
     /// Report the phone's key service and, given a key directory Android
     /// wrote, unwrap the key it holds and say how long it is.
     #[cfg(target_os = "android")]
@@ -334,6 +339,20 @@ fn main() -> Result<()> {
             }
             let raw = stored.unwrap(skyward_crypto::keystore::Unwrap::Hardware(&service))?;
             println!("{} holds a key of {} bytes", key.display(), raw.len());
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::Keymaster => {
+            let hardware = skyward_binder::driver::Binder::hardware()?;
+            let service = skyward_crypto::keymaster_hidl::Keymaster::open(&hardware)?;
+            println!("the key service of the older kind answers for {}", service.serves()?);
+            let info = service.hardware_info()?;
+            println!(
+                "the secure world is a {} one; it calls itself {} and credits {}",
+                skyward_crypto::keymaster_hidl::level_name(info.level),
+                info.name,
+                info.author
+            );
             Ok(())
         }
         #[cfg(target_os = "android")]
@@ -717,6 +736,9 @@ fn recovery() -> Result<()> {
             // partitions the system asks for, as in Android's own recovery:
             // erasing them, which may take super with them, and undoing
             // shared blocks, which writes to the slot's own.
+            // An A-only phone carries one copy of every partition and no slot
+            // suffix; its logical partitions are named without one, which is
+            // what Slot::Only stands for.
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
                 prepare(&cfg, booted_slot()?)?;
             }

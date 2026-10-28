@@ -30,8 +30,18 @@ impl Entry {
 
 /// An initramfs held in memory, so entries keep their owners, modes and
 /// device numbers exactly as the archive had them.
+/// How the initramfs is compressed. A recovery for an old phone carries it
+/// with gzip, as the stock one did, because that kernel reads no LZ4 framing;
+/// a GKI phone's boot ramdisk is LZ4 legacy framed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    Gzip,
+    Lz4,
+}
+
 pub struct Ramdisk {
     pub entries: Vec<Entry>,
+    pub compression: Compression,
 }
 
 impl Ramdisk {
@@ -39,7 +49,16 @@ impl Ramdisk {
     /// boot images carry.
     pub fn decode(compressed: &[u8]) -> Result<Self> {
         let mut cpio = Vec::new();
-        lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        let compression = match compressed.get(..2) {
+            Some([0x1f, 0x8b]) => {
+                flate2::read::GzDecoder::new(compressed).read_to_end(&mut cpio).context("gzip decode")?;
+                Compression::Gzip
+            }
+            _ => {
+                lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+                Compression::Lz4
+            }
+        };
         let mut entries = Vec::new();
         let mut rest = Cursor::new(cpio.as_slice());
         loop {
@@ -63,7 +82,7 @@ impl Ramdisk {
             entries.push(entry);
             rest = r.finish().context("cpio entry end")?;
         }
-        Ok(Ramdisk { entries })
+        Ok(Ramdisk { entries, compression })
     }
 
     /// Pack as a newc archive compressed the way AOSP packs boot ramdisks,
@@ -89,7 +108,16 @@ impl Ramdisk {
             w.finish()?;
         }
         cpio::newc::trailer(&mut cpio)?;
-        lz4_legacy(&cpio)
+        match self.compression {
+            Compression::Lz4 => lz4_legacy(&cpio),
+            Compression::Gzip => {
+                let mut out = Vec::new();
+                let mut encoder = flate2::write::GzEncoder::new(&mut out, flate2::Compression::best());
+                encoder.write_all(&cpio).context("gzip encode")?;
+                encoder.finish().context("gzip encode")?;
+                Ok(out)
+            }
+        }
     }
 
     pub fn find(&self, name: &str) -> Option<&Entry> {
@@ -160,7 +188,7 @@ mod tests {
 
     #[test]
     fn round_trip_keeps_metadata() {
-        let mut rd = Ramdisk { entries: Vec::new() };
+        let mut rd = Ramdisk { entries: Vec::new(), compression: Compression::Lz4 };
         rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
         rd.entries.push(Entry {
             name: "dev/console".into(),

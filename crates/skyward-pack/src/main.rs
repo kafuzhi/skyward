@@ -46,6 +46,30 @@ enum Cmd {
     /// service becomes Skyward. The image fills the whole partition and ends
     /// in an unsigned AVB footer of its own.
     Recovery {
+        /// Build on a ramdisk that already holds another custom recovery,
+        /// whose init runs on the phone's own kernel: the recovery binary in
+        /// it is replaced, as on a stock ramdisk.
+        #[arg(long)]
+        custom_ramdisk: bool,
+        /// Keep this image's boot parameters instead of the ones the kernel's
+        /// own build came with.
+        #[arg(long)]
+        keep_cmdline: bool,
+        /// An image whose ramdisk holds the shell tools install scripts are
+        /// written for, which this one's ramdisk lacks: busybox, awk and the
+        /// unzip a recovery brings.
+        #[arg(long)]
+        tools: Option<PathBuf>,
+        /// A kernel image file, as a phone's own build ships it in an
+        /// anykernel package, to replace the stock recovery's kernel with:
+        /// the vendor partition's kernel modules are built against it.
+        #[arg(long)]
+        kernel_blob: Option<PathBuf>,
+        /// An image to take the kernel and the device trees from, keeping
+        /// this one's ramdisk: the phone's own build, whose kernel reads the
+        /// filesystems a ported system is packed in.
+        #[arg(long)]
+        kernel: Option<PathBuf>,
         /// The device's stock recovery image: the whole partition, as the
         /// phone or a full update package holds it, ending in its AVB footer.
         #[arg(long)]
@@ -103,14 +127,28 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, kernel, custom_ramdisk, keep_cmdline, tools, kernel_blob, binary, config, font, mono, mono_license, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
+            if let Some(blob) = &kernel_blob {
+                let bytes = std::fs::read(blob).with_context(|| format!("read {}", blob.display()))?;
+                eprintln!("kernel: {} bytes from {}", bytes.len(), blob.display());
+                img.kernel = bytes;
+            }
+            if let Some(kernel) = &kernel {
+                let mut other = BootImage::read(kernel).with_context(|| format!("read {}", kernel.display()))?;
+                if keep_cmdline {
+                    other.forget_cmdline();
+                }
+                img.adopt_kernel(other);
+            }
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
             // A stock recovery ramdisk has no third-party tree; refuse to build
             // on top of another custom recovery.
-            if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
-                anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
+            if !custom_ramdisk {
+                if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
+                    anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
+                }
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
             skyward_config::DeviceConfig::load(&config)?;
@@ -125,6 +163,57 @@ fn main() -> Result<()> {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
             rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            // A ramdisk from another custom recovery binds the USB gadget
+            // itself for MTP, over the rules Skyward's own mtp.rc adds: two
+            // sets of rules binding one gadget leave the file transfer
+            // broken. The other recovery's rules that bind it for MTP go, so
+            // that the ones here are the only ones left.
+            if custom_ramdisk {
+                if let Some(rc) = rd.find(USB_RC_FILE) {
+                    let text = String::from_utf8_lossy(&rc.data).to_string();
+                    // The other recovery binds the kernel's own MTP function,
+                    // which its daemon reaches over /dev/mtp_usb. Skyward
+                    // serves the function itself, over functionfs, so the
+                    // gadget binds a functionfs MTP function instead: the
+                    // rest of its rules are kept as they are.
+                    let ours = text.replace("functions/mtp.gs0", "functions/ffs.mtp");
+                    if ours != text {
+                        eprintln!("usb: the gadget's MTP function is this recovery's own, over functionfs");
+                        rd.replace(USB_RC_FILE, ours.into_bytes())?;
+                    }
+                }
+            }
+
+            // The shell tools an install script starts with, taken from a
+            // ramdisk that has them, and put where its PATH looks.
+            if let Some(tools) = &tools {
+                let other = BootImage::read(tools).with_context(|| format!("read {}", tools.display()))?;
+                let mut from = Ramdisk::decode(&other.ramdisk).with_context(|| format!("{}: ramdisk", tools.display()))?;
+                for name in ["system/bin/busybox", "system/bin/awk", "system/bin/ziptool"] {
+                    if let Some(entry) = from.entries.iter().find(|e| e.name == name) {
+                        let data = entry.data.clone();
+                        rd.replace(name, data).or_else(|_| rd.add(name, entry.mode, entry.data.clone()))?;
+                    }
+                }
+                rd.add("system/bin/unzip", 0o120777, b"ziptool".to_vec())?;
+                let mut rc = rd.find(BINDER_RC_FILE).map(|e| e.data.clone()).unwrap_or_default();
+                rc.extend_from_slice(b"\non init\n    exec -- /system/bin/busybox --install -s /sbin\n");
+                rd.replace(BINDER_RC_FILE, rc)?;
+                eprintln!("tools: busybox, awk, unzip and their applets come from {}", tools.display());
+                let _ = &mut from;
+            }
+
+            // An old phone's recovery ramdisk hands binder to no one until the
+            // maker's own factory reset path asks for it, and Skyward talks to
+            // the phone's hardware services over it: mount binderfs as soon as
+            // init runs, the way a GKI recovery's ramdisk already has.
+            if let Some(rc) = rd.find(BINDER_RC_FILE) {
+                if !rc.data.windows(7).any(|w| w == b"binderf") {
+                    let mut data = rc.data.clone();
+                    data.extend_from_slice(BINDER_RC.as_bytes());
+                    rd.replace(BINDER_RC_FILE, data)?;
+                }
+            }
             // On an unlocked device adbd keeps root when ro.secure is 0 and
             // lets any computer in without authorization when ro.adb.secure is
             // 0; init lets a later line of a property file override an earlier
@@ -155,6 +244,23 @@ fn main() -> Result<()> {
 
 /// The partition a recovery is made on, as a full update package names it.
 const RECOVERY: &str = "recovery";
+
+/// The init script a Qualcomm phone's recovery ramdisk imports, and what this
+/// adds to it: binderfs, which the phone's hardware services are reached over.
+const BINDER_RC_FILE: &str = "init.recovery.qcom.rc";
+const USB_RC_FILE: &str = "init.recovery.usb.rc";
+const BINDER_RC: &str = r#"
+
+on early-init
+    mkdir /dev/binderfs
+    mount binder binder /dev/binderfs stats=global
+    symlink /dev/binderfs/binder /dev/binder
+    symlink /dev/binderfs/hwbinder /dev/hwbinder
+    symlink /dev/binderfs/vndbinder /dev/vndbinder
+    chmod 0666 /dev/binderfs/binder
+    chmod 0666 /dev/binderfs/hwbinder
+    chmod 0666 /dev/binderfs/vndbinder
+"#;
 
 /// Take the recovery partition out of the stock build's full update package
 /// on its server, reading only what that partition takes of it, and write it
@@ -233,6 +339,31 @@ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
 }
 
 /// Write `bytes`, the image `img` makes, to `out`.
+/// The init script with every `on` block that binds the USB gadget for MTP
+/// taken out, and every other block kept as it was.
+fn drop_mtp_gadget_rules(text: &str) -> String {
+    let binds = |block: &[&str]| {
+        block.iter().any(|l| l.contains("sys.usb.config=mtp")) && block.iter().any(|l| l.contains("g1/UDC"))
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("on ") {
+            if !binds(&block) {
+                kept.extend(block.iter().copied());
+            }
+            block.clear();
+        }
+        block.push(line);
+    }
+    if !binds(&block) {
+        kept.extend(block.iter().copied());
+    }
+    let mut out = kept.join("\n");
+    out.push('\n');
+    out
+}
+
 fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
     println!(
@@ -247,14 +378,20 @@ fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
 
 fn list(image: &Path) -> Result<()> {
     let img = BootImage::read(image)?;
-    let h = &img.header;
-    println!(
-        "header v{}  kernel {} bytes  ramdisk {} bytes  {:?}",
-        h.header_version(),
-        img.kernel.len(),
-        img.ramdisk.len(),
-        h.osversionpatch
-    );
+    match &img.header {
+        Some(h) => println!(
+            "header v{}  kernel {} bytes  ramdisk {} bytes  {:?}",
+            h.header_version(),
+            img.kernel.len(),
+            img.ramdisk.len(),
+            h.osversionpatch
+        ),
+        None => println!(
+            "header v1/v2 (kernel + ramdisk in one partition)  kernel {} bytes  ramdisk {} bytes",
+            img.kernel.len(),
+            img.ramdisk.len()
+        ),
+    }
     if img.ramdisk.is_empty() {
         return Ok(());
     }

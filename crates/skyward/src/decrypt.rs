@@ -43,7 +43,13 @@ impl Decryptor {
             .name("decrypt".into())
             .spawn(move || {
                 let ended_as = match job {
-                    Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
+                    // A partition the owner left unencrypted mounts as it
+                    // lies; only one that does not is opened with a key.
+                    Job::Open => Ended::Opened(match data::open_plain() {
+                        Ok(opening) => Ok(opening),
+                        Err(plain) => with_key_service(data::open_without_credential)
+                            .map_err(|e| format!("{e} (it does not mount as it lies either: {plain:#})")),
+                    }),
                     Job::Unlock { closed, user, credential } => {
                         Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
                     }

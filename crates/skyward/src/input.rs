@@ -185,12 +185,14 @@ pub struct Inputs {
     seen: HashSet<PathBuf>,
     /// What the touchscreen is told each time its panel is taken in.
     touch_writes: Vec<Write>,
+    /// Devices that call themselves touchscreens but are not.
+    ignore: Vec<String>,
     w: f32,
     h: f32,
 }
 
 impl Inputs {
-    pub fn open(w: u32, h: u32, touch_writes: Vec<Write>) -> Result<Self> {
+    pub fn open(w: u32, h: u32, touch_writes: Vec<Write>, ignore: Vec<String>) -> Result<Self> {
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error()).context("create inotify instance");
@@ -203,7 +205,7 @@ impl Inputs {
             return Err(io::Error::last_os_error()).context("watch /dev/input");
         }
         let mut inputs =
-            Inputs { watch, panel: None, buttons: Vec::new(), seen: HashSet::new(), touch_writes, w: w as f32, h: h as f32 };
+            Inputs { watch, panel: None, buttons: Vec::new(), seen: HashSet::new(), touch_writes, ignore, w: w as f32, h: h as f32 };
         inputs.scan()?;
         if inputs.panel.is_none() {
             eprintln!("no touch panel yet; waiting for one to appear under /dev/input");
@@ -220,12 +222,17 @@ impl Inputs {
             if !self.seen.insert(path.clone()) {
                 continue;
             }
+            let name = dev.name().unwrap_or("?");
+            if self.ignore.iter().any(|n| n == name) {
+                eprintln!("input {}: {name:?} is ignored by the device description", path.display());
+                continue;
+            }
             let direct = dev.properties().contains(PropType::DIRECT);
             let mt = dev
                 .supported_absolute_axes()
                 .is_some_and(|a| a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X) && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y));
             let keys = dev.supported_keys().is_some_and(|k| KEYS.iter().any(|c| k.contains(*c)));
-            eprintln!("input {}: {:?} direct={direct} multitouch={mt} keys={keys}", path.display(), dev.name().unwrap_or("?"));
+            eprintln!("input {}: {name:?} direct={direct} multitouch={mt} keys={keys}", path.display());
             if direct && mt && self.panel.is_none() {
                 self.panel = Some(Panel::new(path, dev)?);
                 for w in &self.touch_writes {

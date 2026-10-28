@@ -204,6 +204,21 @@ pub struct Haptics {
     /// from samples.
     #[serde(default)]
     pub resonance: Option<String>,
+    /// The folder the driver takes a vibration through, as the kernel's own
+    /// interface gives it: `duration` and `activate` under it, or an `enable`
+    /// file for the timed-output kind, which the K30 Pro's driver is.
+    #[serde(default)]
+    pub sysfs: Option<String>,
+    /// How long a click lasts through that interface, in milliseconds.
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+    /// The waveform the driver keeps, by its number, for drivers that play
+    /// one by index rather than by force-feedback effect number.
+    #[serde(default)]
+    pub wave: Option<u32>,
+    /// The driver's own activation mode to set before playing.
+    #[serde(default)]
+    pub mode: Option<u32>,
     pub strength: Strength,
 }
 
@@ -302,6 +317,11 @@ impl Default for Modules {
 /// something before a recovery can read touches from it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Touch {
+    /// Input devices by name that are not the touchscreen, though they report
+    /// themselves as one: the virtual panel a phone's own touch driver makes
+    /// beside the real one, which a recovery would otherwise take for it.
+    #[serde(default)]
+    pub ignore: Vec<String>,
     /// What is written once the touchscreen's input device has appeared,
     /// each value to its file: the driver makes that device as the last
     /// step of starting the controller.
@@ -518,10 +538,14 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            ensure!(
-                haptics.click.is_some() != haptics.resonance.is_some(),
-                "[haptics] names either a waveform the driver keeps or the file it says the motor's resonant frequency in"
-            );
+            // A motor the driver takes a duration for needs neither a waveform
+            // nor a resonant frequency: the interface is named instead.
+            if haptics.sysfs.is_none() {
+                ensure!(
+                    haptics.click.is_some() != haptics.resonance.is_some(),
+                    "[haptics] names either a waveform the driver keeps or the file it says the motor's resonant frequency in"
+                );
+            }
             if let Some(file) = &haptics.resonance {
                 ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
             }

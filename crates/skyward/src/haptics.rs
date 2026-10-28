@@ -30,13 +30,36 @@ const BRAKE_SWINGS: f32 = 1.5;
 /// the click is taken away. So each click is loaded as it is played, at the
 /// strength the slider gives, and taken away once it has played out.
 pub struct Haptics {
-    dev: File,
+    /// The motor as the kernel's timed-output or LED interface takes it;
+    /// none where the driver plays force-feedback effects instead.
+    sysfs: Option<Sysfs>,
+    dev: Option<File>,
     click: Click,
     strength: Strength,
     /// The click playing, by its slot and its count, until it is taken
     /// away; a click taken away early by the next is not taken away again.
     playing: Arc<Mutex<Option<(i16, u64)>>>,
     clicks: u64,
+}
+
+/// Where the kernel's drivers put the interface to a vibration motor.
+const CANDIDATES: [&str; 4] = [
+    "/sys/class/leds/vibrator",
+    "/sys/class/timed_output/vibrator",
+    "/sys/bus/i2c/drivers/aw8697_haptic/2-005a",
+    "/sys/bus/i2c/drivers/aw8697_haptic/3-005a",
+];
+
+/// A motor driven by writing how long to run, the way TWRP has always
+/// driven the ones whose drivers take no force-feedback effects.
+pub struct Sysfs {
+    dir: PathBuf,
+    duration: PathBuf,
+    activate: PathBuf,
+    enable: PathBuf,
+    ms: u32,
+    wave: Option<u32>,
+    mode: Option<u32>,
 }
 
 /// What a click is.
@@ -53,6 +76,36 @@ impl Haptics {
     /// fills the driver's queue with what it plays, so the click is loaded
     /// only as it is played.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
+        if let Some(named) = &cfg.sysfs {
+            let dir = match named.as_str() {
+                // "auto": the interfaces the kernel's own drivers offer, in
+                // the order a recovery has always tried them.
+                "auto" | "" => CANDIDATES
+                    .iter()
+                    .map(PathBuf::from)
+                    .find(|d| d.join("duration").exists() || d.join("enable").exists())
+                    .with_context(|| format!("no vibration interface among {CANDIDATES:?}"))?,
+                _ => PathBuf::from(named),
+            };
+            let sysfs = Sysfs {
+                duration: dir.join("duration"),
+                activate: dir.join("activate"),
+                enable: dir.join("enable"),
+                dir: dir.clone(),
+                ms: cfg.duration_ms.unwrap_or(40),
+                wave: cfg.wave,
+                mode: cfg.mode,
+            };
+            eprintln!("haptics {}: clicks written to the driver, {} ms each", dir.display(), sysfs.ms);
+            return Ok(Haptics {
+                sysfs: Some(sysfs),
+                dev: None,
+                click: Click::Kept(0),
+                strength: cfg.strength,
+                playing: Arc::new(Mutex::new(None)),
+                clicks: 0,
+            });
+        }
         let (path, dev) = motor()?;
         let click = match (cfg.click, &cfg.resonance) {
             (Some(id), _) => {
@@ -66,23 +119,51 @@ impl Haptics {
             }
             (None, None) => unreachable!("the configuration names a click of one kind"),
         };
-        Ok(Haptics { dev, click, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+        Ok(Haptics { sysfs: None, dev: Some(dev), click, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after
     /// taking away one still playing. Gives how long it plays.
     pub fn click(&mut self, position: f32) -> Result<Duration> {
+        if let Some(sysfs) = &self.sysfs {
+            let ms = (f64::from(sysfs.ms) * f64::from(share(&self.strength, position))).round() as u32;
+            let ms = ms.max(1);
+            // The Awinic driver takes the waveform and the mode first, then
+            // how long, and starts on activate; its timer stops it, and the
+            // stop is written anyway for the modes that keep no timer.
+            if sysfs.duration.exists() {
+                if let Some(mode) = sysfs.mode {
+                    let path = sysfs.dir.join("activate_mode");
+                    fs::write(&path, mode.to_string()).with_context(|| format!("write {}", path.display()))?;
+                }
+                if let Some(wave) = sysfs.wave {
+                    let path = sysfs.dir.join("index");
+                    fs::write(&path, wave.to_string()).with_context(|| format!("write {}", path.display()))?;
+                }
+                fs::write(&sysfs.duration, ms.to_string()).with_context(|| format!("write {}", sysfs.duration.display()))?;
+                fs::write(&sysfs.activate, "1").with_context(|| format!("write {}", sysfs.activate.display()))?;
+                let stop = sysfs.activate.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(u64::from(ms) + 20));
+                    let _ = fs::write(&stop, "0");
+                });
+            } else {
+                fs::write(&sysfs.enable, ms.to_string()).with_context(|| format!("write {}", sysfs.enable.display()))?;
+            }
+            return Ok(Duration::from_millis(u64::from(ms)));
+        }
+        let dev = self.dev.as_ref().expect("the force-feedback motor is open");
         let mut playing = self.playing.lock().expect("no thread panics while it holds the click playing");
         if let Some((slot, _)) = playing.take() {
-            erase(&self.dev, slot).context("take away the click still playing")?;
+            erase(dev, slot).context("take away the click still playing")?;
         }
-        let loaded = upload(&self.dev, &self.click, share(&self.strength, position)).context("load the click")?;
-        play(&mut self.dev, loaded.slot).context("play the click")?;
+        let loaded = upload(dev, &self.click, share(&self.strength, position)).context("load the click")?;
+        play(self.dev.as_mut().expect("the motor is open"), loaded.slot).context("play the click")?;
         self.clicks += 1;
         let this = (loaded.slot, self.clicks);
         *playing = Some(this);
         drop(playing);
-        let dev = self.dev.try_clone().context("share the motor")?;
+        let dev = self.dev.as_ref().expect("the motor is open").try_clone().context("share the motor")?;
         let (playing, length) = (self.playing.clone(), loaded.length);
         std::thread::spawn(move || {
             std::thread::sleep(length);

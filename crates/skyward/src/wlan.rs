@@ -669,14 +669,21 @@ impl Station {
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
+        // A file or a switch the driver does not ask for is no reason to
+        // give up: the driver is loaded either way, and whether it made its
+        // interface is what says if it worked.
         for file in &cfg.firmware {
-            place(file)?;
+            if let Err(e) = place(file) {
+                let _ = skyward_sys::kmsg(&format!("wlan: {}: {e:#}", file.name));
+            }
         }
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
         for w in &cfg.writes {
-            fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
+            if let Err(e) = fs::write(&w.path, &w.value) {
+                let _ = skyward_sys::kmsg(&format!("wlan: write {} to {}: {e}", w.value, w.path));
+            }
         }
         let until = Instant::now() + INTERFACE_WAIT;
         while !net.exists() {
@@ -687,13 +694,71 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     iface::set_up(&cfg.interface, true)
 }
 
+/// Read a file the description names, trying where a phone's own build keeps
+/// it as well: a vendor partition's wifi folder, the firmware folder the
+/// loader reads, and the odm partition's copy, in that order after the path
+/// named.
+fn read_from_candidates(named: &str) -> Result<Vec<u8>> {
+    let name = Path::new(named).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| named.to_string());
+    let candidates = [
+        named.to_string(),
+        format!("/vendor/etc/wifi/{name}"),
+        format!("/vendor/firmware/wlan/qca_cld/{name}"),
+        format!("/odm/etc/wifi/{name}"),
+        format!("/odm/firmware/{name}"),
+    ];
+    let mut why = Vec::new();
+    for path in &candidates {
+        match fs::read(path) {
+            Ok(bytes) => {
+                let _ = skyward_sys::kmsg(&format!("wlan: {name} came from {path}"));
+                return Ok(bytes);
+            }
+            Err(e) => why.push(format!("{path}: {e}")),
+        }
+    }
+    // A phone's own build may keep it anywhere under the partitions it ships
+    // its drivers on: the folder is searched for the name, so that a
+    // description written for another build still finds it.
+    for root in ["/vendor", "/odm", "/system"] {
+        if let Some(found) = find_below(Path::new(root), &name, 5) {
+            if let Ok(bytes) = fs::read(&found) {
+                let _ = skyward_sys::kmsg(&format!("wlan: {name} came from {}", found.display()));
+                return Ok(bytes);
+            }
+        }
+    }
+    Err(anyhow::anyhow!("nowhere it is looked for holds {name}: {}", why.join("; ")))
+}
+
+/// The first file called `name` under `root`, `depth` folders down at most,
+/// left to right, or none.
+fn find_below(root: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+    let mut queue = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, at)) = queue.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() && at < depth => queue.push((path, at + 1)),
+                Ok(kind) if kind.is_file() && path.file_name().is_some_and(|n| n == name) => return Some(path),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// Put a file the driver asks for where the firmware loader looks.
 fn place(file: &Firmware) -> Result<()> {
     let to = Path::new(FIRMWARE).join(&file.name);
     let dir = to.parent().expect("a firmware file is in a folder");
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
     let bytes = match &file.partition {
-        None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
+        None => read_from_candidates(&file.path).with_context(|| format!("read {}", file.path))?,
         Some(partition) => {
             let at = Path::new(PARTITIONS).join(partition);
             fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
