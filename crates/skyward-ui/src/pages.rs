@@ -91,7 +91,6 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::TimeZone => time_zone(cx),
         Screen::Logs => logs(cx),
         Screen::Update => update(cx),
-        Screen::Avb => avb(cx),
         Screen::License => license(cx),
         Screen::FontLicense => font_license(cx),
         Screen::Slot => slot(cx),
@@ -118,7 +117,6 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
             FsAction::Repair => (["滑动以修复", "滑動以修復", "Slide to repair"], true),
             FsAction::Remake(_) => (["滑动以更换", "滑動以更換", "Slide to change"], true),
         },
-        Confirm::Avb => (["滑动以关闭校验", "滑動以關閉校驗", "Slide to turn the check off"], true),
         Confirm::Reboot => (["滑动以重启", "滑動以重新啟動", "Slide to reboot"], false),
         Confirm::Wipe => (["滑动以清除", "滑動以清除", "Slide to wipe"], true),
         Confirm::Flash => (["滑动以刷入", "滑動以刷入", "Slide to flash"], true),
@@ -2118,37 +2116,10 @@ pub fn advanced(cx: &Ctx) -> Frame {
         rows.push(Row::new(l.pick(UPDATE)).icon(GREEN, Icon::Layers).trail(Trail::Value(update_value(cx))));
         actions.push(Action::Open(Screen::Update));
     }
-    rows.push(Row::new(l.pick(["禁用 AVB 2.0", "停用 AVB 2.0", "Disable AVB 2.0"])).icon(RED, Icon::Shield));
-    actions.push(Action::Open(Screen::Avb));
+
     let tools = widgets::list(&mut c, t, f, top, &rows);
     let out = hits(&tools.rows, &actions);
     Frame::new(t, c, out, l.pick(ADVANCED), top)
-}
-
-/// The page that turns the bootloader's own check off: what it costs, and
-/// the slide that does it.
-fn avb(cx: &Ctx) -> Frame {
-    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
-    let mut c = long_page(cx);
-    let mut out = Vec::new();
-    let top = t.m.content_top;
-    let what = l.pick([
-        "关闭后，启动器不再校验 boot、recovery、system 等分区的内容。适合刷入未经官方签名的系统或内核。",
-        "關閉後，啟動器不再校驗 boot、recovery、system 等分割區的內容。適合刷入未經官方簽章的系統或核心。",
-        "With the check off, the bootloader no longer verifies what boot, recovery and system hold. What is not signed by the maker then starts too.",
-    ]);
-    let y = widgets::section_first(&mut c, t, f, top, l.pick(["说明", "說明", "What this does"]));
-    let y = widgets::footnote(&mut c, t, f, y, &what);
-    let cost = l.pick([
-        "代价是：任何程序都能改写这些分区并被启动。设备已解锁的前提下才有效。",
-        "代價是：任何程式都能改寫這些分割區並被啟動。裝置已解鎖的前提下才有效。",
-        "What it costs: anything may change those partitions and still start. It only means something on a phone whose bootloader is unlocked.",
-    ]);
-    let y = widgets::footnote(&mut c, t, f, y, &cost);
-    let (label, danger) = confirm_label(Confirm::Avb, s);
-    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
-    out.push(Hit { rect: track, action: Action::Confirm(Confirm::Avb) });
-    Frame::new(t, c, out, l.pick(["禁用 AVB 2.0", "停用 AVB 2.0", "Disable AVB 2.0"]), top)
 }
 
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];

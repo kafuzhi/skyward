@@ -1911,16 +1911,6 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             h.click(app.state.vibration)?;
                         }
                     }
-                    Effect::DisableAvb => {
-                        match crate::avb::disable() {
-                            Ok(written) => {
-                                let said = written.join(", ");
-                                app.report(&format!("已关闭对 {said} 的校验"), now);
-                            }
-                            Err(e) => app.report(&format!("{e:#}"), now),
-                        }
-                        app.refresh();
-                    }
                     // The panel shows the last frame drawn, which is what is
                     // saved; one that cannot be is the page's to report.
                     Effect::Screenshot { storage } => {

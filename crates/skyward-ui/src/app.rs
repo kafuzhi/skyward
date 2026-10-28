@@ -28,8 +28,6 @@ use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
 /// The pages of the recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
-    /// Disabling the bootloader's own check of what it starts.
-    Avb,
     Decrypt,
     Home,
     Settings,
@@ -788,8 +786,6 @@ impl Data {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Confirm {
-    /// Turn off what the bootloader checks before it starts anything.
-    Avb,
     Reboot,
     Wipe,
     Flash,
@@ -1798,9 +1794,6 @@ pub enum Shot {
 /// Work the runtime carries out on the UI's behalf.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
-    /// Write a vbmeta image that turns the check off into every partition
-    /// holding one.
-    DisableAvb,
     Reboot(Target),
     /// A short tap of the vibration motor.
     Haptic,
@@ -5931,7 +5924,6 @@ impl App {
     fn confirmed(&mut self, which: Confirm, now: u64) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
         match which {
-            Confirm::Avb => fx.push(Effect::DisableAvb),
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
             Confirm::Wipe => {
                 let chosen: Vec<Wipe> = WIPES.iter().zip(self.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect();
